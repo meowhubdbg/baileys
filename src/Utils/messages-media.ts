@@ -10,7 +10,7 @@ import { join } from 'path'
 import { Readable, Transform } from 'stream'
 import { URL } from 'url'
 import { proto } from '../../WAProto/index.js'
-import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP, type MediaType } from '../Defaults'
+import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP, NEWSLETTER_MEDIA_PATH_MAP, type MediaType } from '../Defaults'
 import type {
 	BaileysEventMap,
 	DownloadableMessage,
@@ -519,15 +519,10 @@ export type MediaDownloadOptions = {
 export const getUrlFromDirectPath = (directPath: string, host: string = DEF_MEDIA_HOST) =>
 	`https://${host}${directPath}`
 
-// Some media messages (stickers, voice notes, images) carry a `url` on `a.whatsapp.net`,
-// which doesn't resolve. Their `directPath` is valid, so it must go to the default host.
-const PLACEHOLDER_MEDIA_HOST = 'a.whatsapp.net'
-
 const extractHost = (url: string | null | undefined): string | undefined => {
 	if (!url) return undefined
 	try {
-		const host = new URL(url).host
-		return host === PLACEHOLDER_MEDIA_HOST ? undefined : host
+		return new URL(url).host
 	} catch {
 		return undefined
 	}
@@ -686,6 +681,11 @@ type MediaUploadResult = {
 	meta_hmac?: string
 	ts?: number
 	fbid?: number
+	handle?: string
+	thumbnail_info?: {
+		thumbnail_direct_path?: string
+		thumbnail_sha256?: string
+	}
 }
 
 export type UploadParams = {
@@ -828,15 +828,40 @@ const uploadMedia = async (params: UploadParams, logger?: ILogger): Promise<Medi
 	}
 }
 
+// Upload handles for newsletter media, keyed by directPath and consumed when
+// sending to channels. The server requires the newsletter upload `handle` as
+// `media_id` on the <message> node (see whatsmeow's sendNewsletter); without
+// it media like voice notes is rejected with ACK error 479.
+// Only newsletter uploads are stored here (see prepareWAMessageMedia), so
+// regular-chat uploads never accumulate entries.
+const newsletterMediaHandleMap = new Map<string, string>()
+
+/** Stores the upload handle of a newsletter media upload, keyed by directPath. */
+export const setNewsletterMediaHandle = (directPath: string, handle: string) => {
+	newsletterMediaHandleMap.set(directPath, handle)
+}
+
+/** Returns and removes the stored upload handle for a directPath, if any. */
+export const takeNewsletterMediaHandle = (directPath?: string | null): string | undefined => {
+	if (!directPath) {
+		return undefined
+	}
+	const handle = newsletterMediaHandleMap.get(directPath)
+	if (handle) {
+		newsletterMediaHandleMap.delete(directPath)
+	}
+	return handle
+}
+
 export const getWAUploadToServer = (
 	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
 	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>
 ): WAMediaUploadFunction => {
-	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs }) => {
+	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs, newsletter }) => {
 		// send a query JSON to obtain the url & auth token to upload our media
 		let uploadInfo = await refreshMediaConn(false)
 
-		let urls: { mediaUrl: string; directPath: string; meta_hmac?: string; ts?: number; fbid?: number } | undefined
+		let urls: { mediaUrl: string; directPath: string; meta_hmac?: string; ts?: number; fbid?: number; handle?: string; thumbnailDirectPath?: string; thumbnailSha256?: string } | undefined
 		const hosts = [...customUploadHosts, ...uploadInfo.hosts]
 
 		fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileEncSha256B64)
@@ -858,7 +883,11 @@ export const getWAUploadToServer = (
 			logger.debug(`uploading to "${hostname}"`)
 
 			const auth = encodeURIComponent(uploadInfo.auth)
-			const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+			// newsletter uploads use dedicated endpoints which can generate
+			// a server-side thumbnail (used for channel media previews)
+			const mediaPathMap = newsletter ? NEWSLETTER_MEDIA_PATH_MAP : MEDIA_PATH_MAP
+			const serverThumb = newsletter ? '&server_thumb_gen=1' : ''
+			const url = `https://${hostname}${mediaPathMap[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}${serverThumb}`
 
 			let result: MediaUploadResult | undefined
 			try {
@@ -879,7 +908,10 @@ export const getWAUploadToServer = (
 						directPath: result.direct_path!,
 						meta_hmac: result.meta_hmac,
 						fbid: result.fbid,
-						ts: result.ts
+						ts: result.ts,
+						handle: result.handle,
+						thumbnailDirectPath: result.thumbnail_info?.thumbnail_direct_path,
+						thumbnailSha256: result.thumbnail_info?.thumbnail_sha256
 					}
 					break
 				} else {
